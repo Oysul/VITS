@@ -1,3 +1,5 @@
+# 多实例化的模型训练  一次性可以有多种音色 多素材 训练集里要提供谁说的区分
+
 import os
 import json
 import argparse
@@ -62,16 +64,16 @@ def run(rank, n_gpus, hps):
   dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
   torch.manual_seed(hps.train.seed)
   torch.cuda.set_device(rank)
-
-  train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
-  train_sampler = DistributedBucketSampler(
+  #总的来说，对训练数据进行预处理以及调用
+  train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)# 来自data_utils.py 调用训练集
+  train_sampler = DistributedBucketSampler(   # 来自data_utils.py 基于桶的数据集  桶排序，让训练时数据的长度变化不要太大
       train_dataset,
       hps.train.batch_size,
       [32,300,400,500,600,700,800,900,1000],
       num_replicas=n_gpus,
       rank=rank,
       shuffle=True)
-  collate_fn = TextAudioSpeakerCollate()
+  collate_fn = TextAudioSpeakerCollate()  # 来自data_utils.py 对内容进行填充
   train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
       collate_fn=collate_fn, batch_sampler=train_sampler)
   if rank == 0:
@@ -80,13 +82,14 @@ def run(rank, n_gpus, hps):
         batch_size=hps.train.batch_size, pin_memory=True,
         drop_last=False, collate_fn=collate_fn)
 
-  net_g = SynthesizerTrn(
+  net_g = SynthesizerTrn(  #文本到音频 的生成器   在models.py里
       len(symbols),
       hps.data.filter_length // 2 + 1,
       hps.train.segment_size // hps.data.hop_length,
       n_speakers=hps.data.n_speakers,
       **hps.model).cuda(rank)
   net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+  #GAN 训练的两个优化器
   optim_g = torch.optim.AdamW(
       net_g.parameters(), 
       hps.train.learning_rate, 
@@ -107,11 +110,11 @@ def run(rank, n_gpus, hps):
   except:
     epoch_str = 1
     global_step = 0
-
+  #生成器和判别器的学习率 指数衰减方案
   scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
   scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
 
-  scaler = GradScaler(enabled=hps.train.fp16_run)
+  scaler = GradScaler(enabled=hps.train.fp16_run)#混合精度训练
 
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
@@ -121,7 +124,7 @@ def run(rank, n_gpus, hps):
     scheduler_g.step()
     scheduler_d.step()
 
-
+# 基于VAE的GAN训练 主函数
 def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
   net_g, net_d = nets
   optim_g, optim_d = optims
@@ -130,22 +133,22 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   if writers is not None:
     writer, writer_eval = writers
 
-  train_loader.batch_sampler.set_epoch(epoch)
+  train_loader.batch_sampler.set_epoch(epoch)#随机化
   global global_step
 
-  net_g.train()
+  net_g.train()#进入train模式
   net_d.train()
   for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths, speakers) in enumerate(train_loader):
     x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
     spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
-    speakers = speakers.cuda(rank, non_blocking=True)
+    speakers = speakers.cuda(rank, non_blocking=True)#将七个参数给GPU
 
     with autocast(enabled=hps.train.fp16_run):
       y_hat, l_length, attn, ids_slice, x_mask, z_mask,\
       (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths, speakers)
-
-      mel = spec_to_mel_torch(
+    #ids_slice 频谱采样一部分 送进生成器里，节约运行空间的
+      mel = spec_to_mel_torch( #线性谱转化为 mel谱  后面用于loss的标签
           spec, 
           hps.data.filter_length, 
           hps.data.n_mel_channels, 
@@ -153,6 +156,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
           hps.data.mel_fmin, 
           hps.data.mel_fmax)
       y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
+      #真实的音频mel
       y_hat_mel = mel_spectrogram_torch(
           y_hat.squeeze(1), 
           hps.data.filter_length, 
@@ -162,41 +166,41 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
           hps.data.win_length, 
           hps.data.mel_fmin, 
           hps.data.mel_fmax
-      )
+      )#预测的mel
 
       y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size) # slice 
-
+      #采样后 真实音频对应的部分
       # Discriminator
       y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
       with autocast(enabled=False):
         loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
-        loss_disc_all = loss_disc
+        loss_disc_all = loss_disc #判别器总的损失
     optim_d.zero_grad()
     scaler.scale(loss_disc_all).backward()
     scaler.unscale_(optim_d)
     grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-    scaler.step(optim_d)
+    scaler.step(optim_d) #判别器更新
 
     with autocast(enabled=hps.train.fp16_run):
       # Generator
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
       with autocast(enabled=False):
-        loss_dur = torch.sum(l_length.float())
-        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+        loss_dur = torch.sum(l_length.float())#变分的loss 求和
+        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel#mel谱重构的loss
+        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl#kl散度loss 在losses.py
 
-        loss_fm = feature_loss(fmap_r, fmap_g)
-        loss_gen, losses_gen = generator_loss(y_d_hat_g)
+        loss_fm = feature_loss(fmap_r, fmap_g)# 真实和预测送入判别器中得到fm loss
+        loss_gen, losses_gen = generator_loss(y_d_hat_g)#GAN对抗的loss
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
     optim_g.zero_grad()
     scaler.scale(loss_gen_all).backward()
     scaler.unscale_(optim_g)
     grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
     scaler.step(optim_g)
-    scaler.update()
+    scaler.update()#生成器更新
 
     if rank==0:
-      if global_step % hps.train.log_interval == 0:
+      if global_step % hps.train.log_interval == 0: #更新日志 打印loss
         lr = optim_g.param_groups[0]['lr']
         losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
         logger.info('Train Epoch: {} [{:.0f}%]'.format(
@@ -222,7 +226,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
           images=image_dict,
           scalars=scalar_dict)
 
-      if global_step % hps.train.eval_interval == 0:
+      if global_step % hps.train.eval_interval == 0:#整数倍 做验证
         evaluate(hps, net_g, eval_loader, writer_eval)
         utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
         utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))

@@ -295,7 +295,7 @@ class ElementwiseAffine(nn.Module):
       return x
 
 
-class ResidualCouplingLayer(nn.Module):
+class ResidualCoupli ngLayer(nn.Module):
   def __init__(self,
       channels,
       hidden_channels,
@@ -322,16 +322,18 @@ class ResidualCouplingLayer(nn.Module):
     self.post.bias.data.zero_()
 
   def forward(self, x, x_mask, g=None, reverse=False):
-    x0, x1 = torch.split(x, [self.half_channels]*2, 1)
+    x0, x1 = torch.split(x, [self.half_channels]*2, 1)# 按特征分割成两部分
     h = self.pre(x0) * x_mask
     h = self.enc(h, x_mask, g=g)
-    stats = self.post(h) * x_mask
+    stats = self.post(h) * x_mask #post层
     if not self.mean_only:
+      #均值 对数标准差
       m, logs = torch.split(stats, [self.half_channels]*2, 1)
-    else:
-      m = stats
+    else:  # ax+b
+      m = stats #b 只预测平移量
       logs = torch.zeros_like(m)
 
+#只变换x1   x0不变
     if not reverse:
       x1 = m + x1 * torch.exp(logs) * x_mask
       x = torch.cat([x0, x1], 1)

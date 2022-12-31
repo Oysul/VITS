@@ -132,7 +132,7 @@ class DurationPredictor(nn.Module):
     return x * x_mask
 
 
-class TextEncoder(nn.Module):
+class  TextEncoder(nn.Module):
   def __init__(self,
       n_vocab,
       out_channels,
@@ -152,7 +152,7 @@ class TextEncoder(nn.Module):
     self.kernel_size = kernel_size
     self.p_dropout = p_dropout
 
-    self.emb = nn.Embedding(n_vocab, hidden_channels)
+    self.emb = nn.Embedding(n_vocab, hidden_channels)#单词映射到Embedding向量
     nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
 
     self.encoder = attentions.Encoder(
@@ -162,18 +162,19 @@ class TextEncoder(nn.Module):
       n_layers,
       kernel_size,
       p_dropout)
-    self.proj= nn.Conv1d(hidden_channels, out_channels * 2, 1)
+    self.proj= nn.Conv1d(hidden_channels, out_channels * 2, 1)#映射层 MLP
 
   def forward(self, x, x_lengths):
     x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
     x = torch.transpose(x, 1, -1) # [b, h, t]
     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
 
-    x = self.encoder(x * x_mask, x_mask)
+    x = self.encoder(x * x_mask, x_mask)#Embedding和mask一起送入transform的encoder，得到上下文相关的表征新x
     stats = self.proj(x) * x_mask
 
     m, logs = torch.split(stats, self.out_channels, dim=1)
-    return x, m, logs, x_mask
+    #均值 标准差的对数  是先验编码器预测的两个分布的参数
+    return x, m, logs, x_mask #先验的高斯分布
 
 
 class ResidualCouplingBlock(nn.Module):
@@ -198,9 +199,10 @@ class ResidualCouplingBlock(nn.Module):
     for i in range(n_flows):
       self.flows.append(modules.ResidualCouplingLayer(channels, hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=gin_channels, mean_only=True))
       self.flows.append(modules.Flip())
+      #分两半耦合的flow 用flip下一半也加入
 
   def forward(self, x, x_mask, g=None, reverse=False):
-    if not reverse:
+    if not reverse:  #正逆变换 不需要算logs 一定是0
       for flow in self.flows:
         x, _ = flow(x, x_mask, g=g, reverse=reverse)
     else:
@@ -209,7 +211,7 @@ class ResidualCouplingBlock(nn.Module):
     return x
 
 
-class PosteriorEncoder(nn.Module):
+class PosteriorEncoder(nn.Module):#一维卷积
   def __init__(self,
       in_channels,
       out_channels,
@@ -231,13 +233,13 @@ class PosteriorEncoder(nn.Module):
     self.enc = modules.WN(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=gin_channels)
     self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-  def forward(self, x, x_lengths, g=None):
+  def forward(self, x, x_lengths, g=None):#x线性谱  g条件
     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
     x = self.pre(x) * x_mask
     x = self.enc(x, x_mask, g=g)
     stats = self.proj(x) * x_mask
     m, logs = torch.split(stats, self.out_channels, dim=1)
-    z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
+    z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask#重参数化技巧
     return z, m, logs, x_mask
 
 
@@ -435,8 +437,8 @@ class SynthesizerTrn(nn.Module):
     self.gin_channels = gin_channels
 
     self.use_sdp = use_sdp
-
-    self.enc_p = TextEncoder(n_vocab,
+#得到文本的先验分布 
+    self.enc_p = TextEncoder(n_vocab, #文本编码器 将上下文连贯
         inter_channels,
         hidden_channels,
         filter_channels,
@@ -445,14 +447,16 @@ class SynthesizerTrn(nn.Module):
         kernel_size,
         p_dropout)
     self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=gin_channels)
+    #波形生成器
     self.enc_q = PosteriorEncoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
+    #后验编码器  只是一个简单的高斯分布
     self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
-
-    if use_sdp:
+#论文中提到 先验后加一个flow 对先验分布提高表达能力
+    if use_sdp: #默认使用sdp 随机时长预测器 表示说话的韵律节奏
       self.dp = StochasticDurationPredictor(hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels)
     else:
       self.dp = DurationPredictor(hidden_channels, 256, 3, 0.5, gin_channels=gin_channels)
-
+#说话人身份id
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
@@ -465,9 +469,9 @@ class SynthesizerTrn(nn.Module):
       g = None
 
     z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
-    z_p = self.flow(z, y_mask, g=g)
+    z_p = self.flow(z, y_mask, g=g)  #为什么是后验 重点！！！
 
-    with torch.no_grad():
+    with torch.no_grad(): #动态规划  让文本和频谱对齐 论文里MonotonicAlignmentSearch算法
       # negative cross-entropy
       s_p_sq_r = torch.exp(-2 * logs_p) # [b, d, t]
       neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True) # [b, 1, t_s]
@@ -479,7 +483,8 @@ class SynthesizerTrn(nn.Module):
       attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
       attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
 
-    w = attn.sum(2)
+    w = attn.sum(2)#[b,1,T_t] 每个text对应频谱多少个
+
     if self.use_sdp:
       l_length = self.dp(x, x_mask, w, g=g)
       l_length = l_length / torch.sum(x_mask)
