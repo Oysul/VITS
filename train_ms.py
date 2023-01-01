@@ -65,8 +65,10 @@ def run(rank, n_gpus, hps):
   torch.manual_seed(hps.train.seed)
   torch.cuda.set_device(rank)
   #总的来说，对训练数据进行预处理以及调用
-  train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)# 来自data_utils.py 调用训练集
-  train_sampler = DistributedBucketSampler(   # 来自data_utils.py 基于桶的数据集  桶排序，让训练时数据的长度变化不要太大
+  train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
+  # 来自data_utils.py 调用训练集
+  train_sampler = DistributedBucketSampler(   
+    # 来自data_utils.py 基于桶的数据集  桶排序，让训练时数据的长度变化不要太大
       train_dataset,
       hps.train.batch_size,
       [32,300,400,500,600,700,800,900,1000],
@@ -88,7 +90,7 @@ def run(rank, n_gpus, hps):
       hps.train.segment_size // hps.data.hop_length,
       n_speakers=hps.data.n_speakers,
       **hps.model).cuda(rank)
-  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)# 判别器
   #GAN 训练的两个优化器
   optim_g = torch.optim.AdamW(
       net_g.parameters(), 

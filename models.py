@@ -15,6 +15,7 @@ from commons import init_weights, get_padding
 
 
 class StochasticDurationPredictor(nn.Module):
+  #随机时长预测器，为了表达人在不同时间说话是不一样的。基于flow去设计。
   def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, n_flows=4, gin_channels=0):
     super().__init__()
     filter_channels = in_channels # it needs to be removed from future version.
@@ -26,6 +27,7 @@ class StochasticDurationPredictor(nn.Module):
     self.gin_channels = gin_channels
 
     self.log_flow = modules.Log()
+    
     self.flows = nn.ModuleList()
     self.flows.append(modules.ElementwiseAffine(2))
     for i in range(n_flows):
@@ -35,6 +37,7 @@ class StochasticDurationPredictor(nn.Module):
     self.post_pre = nn.Conv1d(1, filter_channels, 1)
     self.post_proj = nn.Conv1d(filter_channels, filter_channels, 1)
     self.post_convs = modules.DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
+    
     self.post_flows = nn.ModuleList()
     self.post_flows.append(modules.ElementwiseAffine(2))
     for i in range(4):
@@ -43,19 +46,21 @@ class StochasticDurationPredictor(nn.Module):
 
     self.pre = nn.Conv1d(in_channels, filter_channels, 1)
     self.proj = nn.Conv1d(filter_channels, filter_channels, 1)
+    
     self.convs = modules.DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
     if gin_channels != 0:
       self.cond = nn.Conv1d(gin_channels, filter_channels, 1)
 
   def forward(self, x, x_mask, w=None, g=None, reverse=False, noise_scale=1.0):
-    x = torch.detach(x)
-    x = self.pre(x)
+    #x 是文本状态 w是时长
+    x = torch.detach(x)#分离，不要影响文本编码器
+    x = self.pre(x)#一维卷积，pre层
     if g is not None:
       g = torch.detach(g)
       x = x + self.cond(g)
     x = self.convs(x, x_mask)
     x = self.proj(x) * x_mask
-
+    #预处理后，x是论文中的c了
     if not reverse:
       flows = self.flows
       assert w is not None
@@ -64,16 +69,21 @@ class StochasticDurationPredictor(nn.Module):
       h_w = self.post_pre(w)
       h_w = self.post_convs(h_w, x_mask)
       h_w = self.post_proj(h_w) * x_mask
+      #时长的预处理， h_w是论文里的d
       e_q = torch.randn(w.size(0), 2, w.size(2)).to(device=x.device, dtype=x.dtype) * x_mask
+      #随机噪声
       z_q = e_q
       for flow in self.post_flows:
         z_q, logdet_q = flow(z_q, x_mask, g=(x + h_w))
         logdet_tot_q += logdet_q
       z_u, z1 = torch.split(z_q, [1, 1], 1) 
       u = torch.sigmoid(z_u) * x_mask
-      z0 = (w - u) * x_mask
+      #得到了u，v(z1)，后验分布的对数似然已经可以算出来了
+      z0 = (w - u) * x_mask#d-u是整数 
+
       logdet_tot_q += torch.sum((F.logsigmoid(z_u) + F.logsigmoid(-z_u)) * x_mask, [1,2])
       logq = torch.sum(-0.5 * (math.log(2*math.pi) + (e_q**2)) * x_mask, [1,2]) - logdet_tot_q
+      #这两项是后验分布的对数似然
 
       logdet_tot = 0
       z0, logdet = self.log_flow(z0, x_mask)
@@ -83,8 +93,9 @@ class StochasticDurationPredictor(nn.Module):
         z, logdet = flow(z, x_mask, g=x, reverse=reverse)
         logdet_tot = logdet_tot + logdet
       nll = torch.sum(0.5 * (math.log(2*math.pi) + (z**2)) * x_mask, [1,2]) - logdet_tot
-      return nll + logq # [b]
-    else:
+      #nll 先验分布的负 对数似然
+      return nll + logq # [b] 要优化的上界
+    else: #推理阶段
       flows = list(reversed(self.flows))
       flows = flows[:-2] + [flows[-1]] # remove a useless vflow
       z = torch.randn(x.size(0), 2, x.size(2)).to(device=x.device, dtype=x.dtype) * noise_scale
@@ -164,12 +175,13 @@ class  TextEncoder(nn.Module):
       p_dropout)
     self.proj= nn.Conv1d(hidden_channels, out_channels * 2, 1)#映射层 MLP
 
-  def forward(self, x, x_lengths):
+  def forward(self, x, x_lengths): #得到文本的先验分布
     x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
     x = torch.transpose(x, 1, -1) # [b, h, t]
     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
 
-    x = self.encoder(x * x_mask, x_mask)#Embedding和mask一起送入transform的encoder，得到上下文相关的表征新x
+    x = self.encoder(x * x_mask, x_mask)
+    #Embedding和mask一起送入transform的encoder，得到上下文相关的表征新x
     stats = self.proj(x) * x_mask
 
     m, logs = torch.split(stats, self.out_channels, dim=1)
@@ -452,23 +464,26 @@ class SynthesizerTrn(nn.Module):
     #后验编码器  只是一个简单的高斯分布
     self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
 #论文中提到 先验后加一个flow 对先验分布提高表达能力
+
     if use_sdp: #默认使用sdp 随机时长预测器 表示说话的韵律节奏
       self.dp = StochasticDurationPredictor(hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels)
     else:
       self.dp = DurationPredictor(hidden_channels, 256, 3, 0.5, gin_channels=gin_channels)
+
 #说话人身份id
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
   def forward(self, x, x_lengths, y, y_lengths, sid=None):
 
-    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths) #得到先验分布
     if self.n_speakers > 0:
       g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
     else:
       g = None
 
-    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)#得到后验分布
+
     z_p = self.flow(z, y_mask, g=g)  #为什么是后验 重点！！！
 
     with torch.no_grad(): #动态规划  让文本和频谱对齐 论文里MonotonicAlignmentSearch算法
@@ -485,15 +500,17 @@ class SynthesizerTrn(nn.Module):
 
     w = attn.sum(2)#[b,1,T_t] 每个text对应频谱多少个
 
-    if self.use_sdp:
+#l_length是指loss_length
+    if self.use_sdp:#使用随机时长预测（默认）
       l_length = self.dp(x, x_mask, w, g=g)
       l_length = l_length / torch.sum(x_mask)
-    else:
+    else:#不用
       logw_ = torch.log(w + 1e-6) * x_mask
       logw = self.dp(x, x_mask, g=g)
       l_length = torch.sum((logw - logw_)**2, [1,2]) / torch.sum(x_mask) # for averaging 
 
     # expand prior
+    #对齐之前长度
     m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
     logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 
@@ -527,7 +544,7 @@ class SynthesizerTrn(nn.Module):
     o = self.dec((z * y_mask)[:,:,:max_len], g=g)
     return o, attn, y_mask, (z, z_p, m_p, logs_p)
 
-  def voice_conversion(self, y, y_lengths, sid_src, sid_tgt):
+  def voice_conversion(self, y, y_lengths, sid_src, sid_tgt):#用b的音色，替换a 应用到后验编码器
     assert self.n_speakers > 0, "n_speakers have to be larger than 0."
     g_src = self.emb_g(sid_src).unsqueeze(-1)
     g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)

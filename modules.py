@@ -295,7 +295,7 @@ class ElementwiseAffine(nn.Module):
       return x
 
 
-class ResidualCoupli ngLayer(nn.Module):
+class ResidualCouplingLayer(nn.Module):
   def __init__(self,
       channels,
       hidden_channels,
